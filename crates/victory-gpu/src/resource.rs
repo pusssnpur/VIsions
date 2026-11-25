@@ -242,19 +242,19 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 const RGBA8_UNORM: u32 = 28;
 
 /// The console's packed 16-bit colour formats a title renders to:
-/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
-const PACKED_16: [u32; 2] = [86, 115];
+/// B5G6R5_UNORM (85), B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+const PACKED_16: [u32; 3] = [85, 86, 115];
 
 /// Whether the host GPU lacks render-target or typed unordered-access
 /// support for `format` (asked once per format). NVIDIA has neither for
-/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
+/// B4G4R4A4 and no typed UAV for B5G6R5/B5G5R5A1, which Grand Theft Auto VI's
 /// 2560x1440 UI targets need; AMD has both.
 #[cfg(windows)]
 fn host_lacks_target(format: u32) -> bool {
     use std::sync::OnceLock;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    static LACKS: [OnceLock<bool>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
     let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
         return false;
     };
@@ -342,12 +342,18 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn view_format(_: This) -> Option<u32> {
+    None
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -850,9 +856,20 @@ pub(crate) struct HostTexture {
     /// When a list last moved it to a state shaders or draws write in, in
     /// order: of textures in the same memory, the last holds its contents.
     pub(crate) written: std::sync::atomic::AtomicU64,
+    /// Monotonic access tick for LRU placed-texture VRAM eviction.
+    pub(crate) used: std::sync::atomic::AtomicU64,
     /// Planes shaders write as images, for depth textures the title also
     /// writes so ([`crate::twin`]); made on the first such view.
     pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+}
+
+#[cfg(windows)]
+static TEXTURE_USE_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(windows)]
+#[inline]
+fn next_use_tick() -> u64 {
+    TEXTURE_USE_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Textures the host GPU writes, by the title memory they are placed in.
@@ -1071,6 +1088,7 @@ fn allocation_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resour
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
+    host.used.store(next_use_tick(), std::sync::atomic::Ordering::Relaxed);
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1085,7 +1103,10 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host.as_deref().map(|h| {
+        h.used.store(next_use_tick(), std::sync::atomic::Ordering::Relaxed);
+        &h.texture
+    })
 }
 
 /// The twins of a depth texture the title also writes as an image (see
@@ -1109,7 +1130,9 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    let h = resource(this).host.clone()?;
+    h.used.store(next_use_tick(), std::sync::atomic::Ordering::Relaxed);
+    Some(h)
 }
 
 #[cfg(windows)]
@@ -1124,7 +1147,7 @@ thread_local! {
 /// How much of the video memory we may use is in use, in percent, as last
 /// asked a little while ago.
 #[cfg(windows)]
-fn video_memory_percent() -> u64 {
+pub(crate) fn video_memory_percent() -> u64 {
     static LAST: std::sync::Mutex<(Option<std::time::Instant>, u64)> =
         std::sync::Mutex::new((None, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -1137,10 +1160,9 @@ fn video_memory_percent() -> u64 {
     last.1
 }
 
-/// How many of a streamed texture's largest mips to do without, for none of
-/// its sides to pass `VICTORY_TEXTURE_MAX`: by default 1024, 512 and then 256 as
-/// video memory fills up. All textures together did not fit, and paging them
-/// cost seconds a frame, or the driver failed.
+/// How many of a read-only block-compressed texture's largest mips to do
+/// without, for none of its sides to pass `VICTORY_TEXTURE_MAX`: by default
+/// 1024, 512 and then 256 as video memory fills up.
 #[cfg(windows)]
 fn over_cap(d: &ResourceDesc) -> u32 {
     static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1148,14 +1170,26 @@ fn over_cap(d: &ResourceDesc) -> u32 {
         std::env::var("VICTORY_TEXTURE_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
     });
-    if !STREAMED.get() || textures() != Textures::Stream {
+    if textures() != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    let max = set.unwrap_or_else(|| {
+        if crate::host::is_4gb_card() {
+            match video_memory_percent() {
+                0..45 => 256,
+                45..65 => 128,
+                _ => 64,
+            }
+        } else {
+            match video_memory_percent() {
+                0..55 => 1024,
+                55..75 => 512,
+                75..88 => 256,
+                _ => 128,
+            }
+        }
     });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);
@@ -1306,6 +1340,13 @@ fn host_texture(
         return Some((texture, None, skip, true));
     }
     let mut made = create(&d, &mut texture);
+    if made.is_err() {
+        // Under tight VRAM (e.g. 4 GB cards), flush retired resources and
+        // evict idle placed textures before retrying creation.
+        trim_vram();
+        crate::host::flush_retired();
+        made = create(&d, &mut texture);
+    }
     // Not every host GPU offers every use of every format (NVIDIA: no
     // unordered access to BGRA8, no B4G4R4A4 render targets, where the
     // console's AMD GPU has both). Give up the uses the host refuses, UAV
@@ -1429,6 +1470,7 @@ fn hand_out_resource(
                 slot,
                 skip,
                 written: Default::default(),
+                used: next_use_tick().into(),
                 twin: Default::default(),
                 state: state.into(),
             })
@@ -1740,6 +1782,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
+            if let Some(h) = &resource(r as This).host {
+                h.used.store(next_use_tick(), std::sync::atomic::Ordering::Relaxed);
+            }
             return Some(r as This);
         }
     }
@@ -1893,6 +1938,117 @@ pub(crate) fn evict_placed_textures(start: u64, end: u64) {
         for res in evicted {
             resource_release(res as This);
         }
+    }
+}
+
+/// Configured host texture VRAM budget in bytes (`VICTORY_VRAM_BUDGET_MB`, or
+/// 45% of DXGI local budget on 4 GB cards / 65% on larger cards).
+#[cfg(windows)]
+fn vram_budget_bytes() -> u64 {
+    static EXPLICIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(mb) = *EXPLICIT.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+    }) {
+        return mb << 20;
+    }
+    let low_vram = crate::host::is_4gb_card();
+    if let Some([(_, budget), _]) = crate::host::video_memory()
+        && budget > 0
+    {
+        if low_vram {
+            return (budget * 45 / 100).clamp(1024 << 20, 1536 << 20);
+        }
+        return (budget * 65 / 100).max(1024 << 20);
+    }
+    if low_vram {
+        1536 << 20
+    } else {
+        6144 << 20
+    }
+}
+
+/// Evicts the least-recently-used placed textures not currently referenced by
+/// an open command list when total host textures or adapter VRAM usage exceeds
+/// the configured budget. Evicted textures are recreated transparently by
+/// [`texture_at`] if a later draw or bindless slot samples them again.
+#[cfg(windows)]
+pub(crate) fn trim_vram() {
+    use std::sync::atomic::Ordering;
+    if cfg!(test) || textures() == Textures::Keep {
+        return;
+    }
+    crate::host::flush_retired();
+    let low_vram = crate::host::is_4gb_card();
+    let host_bytes = crate::memstat::HOST_TEXTURES.load(Ordering::Relaxed);
+    let budget = vram_budget_bytes();
+    let pct = video_memory_percent();
+    let trigger_pct = if low_vram { 60 } else { 75 };
+    if host_bytes <= budget && pct < trigger_pct {
+        return;
+    }
+    let target_pct = if low_vram { 75 } else { 85 };
+    let target = (budget * target_pct / 100).min(host_bytes.saturating_sub(256 << 20));
+    let mut evicted = Vec::new();
+    let mut freed_bytes = 0u64;
+    {
+        let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        // Only evict placed textures with strong_count == 1 (only `Resource`
+        // itself holds `HostTexture`, not any active command list).
+        let mut candidates: Vec<(u64, (u64, [u32; 14]), usize, u64)> = map
+            .iter()
+            .filter_map(|(&key, &(res, _))| {
+                let r = resource(res as This);
+                let h = r.host.as_ref()?;
+                (std::sync::Arc::strong_count(h) == 1).then(|| {
+                    (
+                        h.used.load(Ordering::Relaxed),
+                        key,
+                        res,
+                        h.bytes,
+                    )
+                })
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|c| c.0);
+        let max_evict = if low_vram {
+            (map.len() / 2).max(128)
+        } else {
+            (map.len() / 3).max(64)
+        };
+        let mut live = PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, key, res, bytes) in candidates.into_iter().take(max_evict) {
+            if host_bytes.saturating_sub(freed_bytes) <= target {
+                break;
+            }
+            if map.remove(&key).is_some() {
+                live.remove(&res);
+                evicted.push(res);
+                freed_bytes += bytes;
+            }
+        }
+        crate::memstat::PLACED_COUNT.store(map.len() as u64, Ordering::Relaxed);
+    }
+    if !evicted.is_empty() {
+        let count = evicted.len();
+        EVICTED.fetch_add(count as u64, Ordering::Relaxed);
+        PLACED_EPOCH.fetch_add(1, Ordering::Release);
+        for res in evicted {
+            resource_release(res as This);
+        }
+        crate::host::flush_retired();
+        tracing::info!(
+            evicted = count,
+            freed_mib = freed_bytes >> 20,
+            remaining_mib = crate::memstat::HOST_TEXTURES.load(Ordering::Relaxed) >> 20,
+            vram_pct = pct,
+            "LRU placed textures evicted to reduce VRAM consumption"
+        );
     }
 }
 

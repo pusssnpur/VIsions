@@ -113,7 +113,7 @@ pub(crate) fn enabled() -> bool {
 
 /// `(min_bytes, max_total_bytes)` for card buffers:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` (default 4 MiB) and
-/// `VICTORY_CARD_BUFFERS_MB` (default 2048 MiB).
+/// `VICTORY_CARD_BUFFERS_MB` (default 512 MiB).
 fn limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
@@ -126,7 +126,7 @@ fn limits() -> (u64, u64) {
         };
         (
             mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20),
-            mb("VICTORY_CARD_BUFFERS_MB", 2048),
+            mb("VICTORY_CARD_BUFFERS_MB", 512),
         )
     })
 }
@@ -179,6 +179,11 @@ impl CardState {
         if !enabled() {
             return None;
         }
+        // On 4 GB GPUs, keep all large title buffers in L0 system RAM unless
+        // the user explicitly opted in via `VICTORY_CARD_BUFFERS_MB`.
+        if crate::host::is_4gb_card() && std::env::var_os("VICTORY_CARD_BUFFERS_MB").is_none() {
+            return None;
+        }
         let (min_bytes, max_bytes) = limits();
         if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
             return None;
@@ -188,7 +193,7 @@ impl CardState {
         }
         if let Some([(used, budget), _]) = crate::host::video_memory()
             && budget > 0
-            && used.saturating_add(size) > budget * 75 / 100
+            && used.saturating_add(size) > budget * 65 / 100
         {
             return None;
         }

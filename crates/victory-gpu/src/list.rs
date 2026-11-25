@@ -2062,6 +2062,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn lists_are_cut_at_waits_that_follow_work() {
         if crate::host::host().is_none() {
             return;

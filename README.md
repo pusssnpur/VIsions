@@ -63,11 +63,47 @@ Memory the title shows at several addresses:
   vehicles were left behind; the distant trees' quads that crossed the
   screen have not come back since either (cause not proven).
 
-AMD:
-- Shaders that crash or never leave the AMD driver's compiler cost only
-  their pipeline, not the run.
+AMD & NVIDIA:
+- Shaders that crash or never leave the driver's compiler cost only their
+  pipeline, not the run.
 - Buffer element counts come from the host's own table, not a size query the
   driver's compiler crashes on.
+- Wave64-on-Wave32 emulation for NVIDIA GPUs (`32-32` wave lanes): wave64
+  compute shaders using `v_permlane16_b32`, `v_permlanex16_b32`, whole-wave
+  reductions, and single-wave LDS workgroups translate to 32-lane waves;
+  `ResourceDescriptorHeap[]` indices are clamped to NVIDIA's 1,000,000
+  shader-visible descriptor limit; packed 16-bit (`B5G6R5`, `B5G5R5A1`,
+  `B4G4R4A4`) render targets/UAVs promote to `R8G8B8A8_UNORM`.
+
+VRAM consumption reduction & 4 GB GPU support:
+- LRU placed-texture VRAM budget eviction (`VICTORY_VRAM_BUDGET_MB`, default
+  45% / 1536 MiB on 4 GB cards and 65% on 8 GB+ cards) releases idle placed
+  textures when VRAM fills up and recreates them on demand.
+- Automatic 4 GB GPU mode (`<= 4.5 GiB` dedicated VRAM or `VICTORY_VRAM_BUDGET_MB <= 2560`):
+  auto-disables VRAM card buffers and GPU upload heaps so large buffers stay in
+  L0 system RAM, drops streamed block-compressed texture mips down to
+  256 px / 128 px / 64 px, shrinks the staging pool to 96 MiB and texture slabs
+  to 2 MiB, retires freed resources within 1–2 frames, and retries committed
+  texture creation after an emergency LRU eviction pass on `E_OUTOFMEMORY`.
+- Dynamic block-compressed texture mip-dropping (`VICTORY_TEXTURE_MAX`) kicks
+  in earlier (1024 px below 55% VRAM, 512 px at 55–75%, 256 px at 75–88%, 128 px
+  above 88% on 8 GB+ cards; 256 px / 128 px / 64 px on 4 GB cards) across all
+  read-only BC 2D textures.
+- Shorter resource retirement window (`VICTORY_KEEP_FRAMES`, default 8,
+  dropping to 1–2 on 4 GB cards or under VRAM pressure), smaller texture-pool
+  slabs (512 KiB–4 MiB slabs, 2 MiB on 4 GB cards), 512 MiB default VRAM
+  card-buffer cap (`VICTORY_CARD_BUFFERS_MB`, 0 MiB on 4 GB cards), and
+  192 MiB staging budget (`VICTORY_STAGING_BUDGET_MB`, 96 MiB on 4 GB cards).
+
+AMD FSR 1.0 (EASU + RCAS) & Native GUI Launcher:
+- Two-pass D3D12 AMD FidelityFX Super Resolution 1.0 (`VICTORY_FSR=ultra-quality|quality|balanced|performance`,
+  `VICTORY_FSR_SHARPNESS=0.2`, `VICTORY_FSR_RESOLUTION=2560x1440`) runs 12-tap
+  Edge-Adaptive Spatial Upsampling (EASU) followed by 5-tap Robust
+  Contrast-Adaptive Sharpening (RCAS) and crisp UI plane composition.
+- Standalone native Win32/D3D12 GUI launcher (`victory` with no arguments or
+  `victory gui`) probes the host GPU adapter, includes one-click **4 GB GPU Preset**
+  and **8 GB Low-VRAM Preset** buttons, configures paths, console profile,
+  FSR 1.0 presets, and VRAM budgets, saves `victory.toml`, and starts the title.
 
 Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
 shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
@@ -77,11 +113,17 @@ Each is described in a comment where it is read.
 
 ### How it is run here
 
-A diagnostics build (`cargo build --profile diag -p victory --features
-diagnostics`), with:
+Launch the standalone native GUI window:
+
+```
+victory
+```
+
+Or run from the command line (a diagnostics build `cargo build --profile diag -p victory --features diagnostics`):
 
 ```
 VICTORY_PRESENT_TARGET=1x1:1
+VICTORY_FSR=quality
 VICTORY_HAIR=1
 victory run <game_scarlett_master.exe> --execute --console series-x
 ```

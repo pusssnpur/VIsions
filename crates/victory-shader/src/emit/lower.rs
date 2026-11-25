@@ -1098,6 +1098,11 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        if !x.target.runs(64) && x.target.runs(32) {
+            // NVIDIA D3D12 caps shader-visible view heaps at 1,000,000 slots
+            // (with 1,024 at the end reserved for memory-by-address views).
+            s.own_slots = 1_000_000 - 1024;
+        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1129,18 +1134,18 @@ impl<'a> Lower<'a> {
                         .map(|(_, inst)| inst)
                 })
             };
-            // Swizzles, DPP and quad derivatives read lanes of the same 32
-            // (rows of 16, groups of 8, 32 or 4): the rest may read the
-            // other half of a wave64.
+            // Swizzles, DPP, `v_permlane16`/`v_permlanex16` and quad derivatives
+            // read lanes of the same 32 (rows of 16, groups of 8, 32 or 4):
+            // the rest may read the other half of a wave64.
             let in_half = |i: &Inst| {
                 i.name().starts_with("ds_swizzle")
+                    || i.name().starts_with("v_permlane")
                     || implicit_derivatives(i.name())
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
             let whole = |i: &Inst| {
                 let n = i.name();
                 n.contains("permute")
-                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     // Its derivatives are the quad's.
                     || n == "image_sample"
@@ -1176,29 +1181,23 @@ impl<'a> Lower<'a> {
             console_lanes = reads_whole || masks_held || live().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            // On a host without 64-lane waves, a wave64 program whose lanes
-            // read only their own half runs as two 32-lane waves: what each
-            // lane reads is in its host wave, at its host lane's place in the
-            // row. Not with LDS (the console compiler may leave out barriers
-            // between the halves) nor whole-wave sections (their reductions
-            // become wave operations over the host's wave).
-            split = console_lanes
-                && x.native.wave64
-                && !reads_whole
-                && !masks_held
-                && s.lds_dwords == 0
+            // On a host without 64-lane waves (NVIDIA), a wave64 program whose
+            // lanes read only their own 32-lane half (or a single-wave group
+            // sharing LDS) runs as two 32-lane waves.
+            split = x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !reads_whole
+                && !masks_held
+                && (console_lanes || one_wave && s.lds_dwords > 0);
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
-            // for a group of one console wave without LDS.
+            // for a group of one console wave.
             wants_console_flow = console_lanes
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"))
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
@@ -1846,9 +1845,6 @@ impl<'a> Lower<'a> {
         };
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
-        }
-        if self.split {
-            return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
         let &m = self
@@ -8181,7 +8177,7 @@ impl<'a> Lower<'a> {
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 self.cross_lane(false)?;
-                if self.split || self.console_cf {
+                if self.console_cf {
                     return Err("a lane permutation in a program split in halves");
                 }
                 let l = self.lane_index();
@@ -15026,4 +15022,69 @@ mod select_tests {
             assert_eq!(wave_ops, uses_select);
         }
     }
+
+    #[test]
+    fn nvidia_wave32_translates_permlane_and_lds_wave64_compute() {
+        let nvidia = crate::emit::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let words = [
+            0xbe81_0380u32, // s_mov_b32 s1, 0
+            0xf408_0200,
+            0xfa00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+            0xbf8c_c07f, // s_waitcnt lgkmcnt(0)
+            0xd777_0002,
+            0x0305_8300, // v_permlane16_b32 v2, v0, -1, -1
+            0xd778_0003,
+            0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xd834_0000,
+            0x0000_0301, // ds_write_b32 v1, v3
+            0xe070_1000,
+            0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+            0xbf81_0000, // s_endpgm
+        ];
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: crate::native::StageIo::Cs(ComputeIo {
+                rsrc2: (1 << 15) | 2, // 512 bytes LDS + 1 user SGPR
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res, nvidia).unwrap();
+        let emitted = Container::parse(&shader.dxil).unwrap();
+        let psv = emitted.part(FourCC::PSV0).unwrap().data;
+        let min_wave = crate::dxbc::u32_at(psv, 4 + 16).unwrap();
+        let max_wave = crate::dxbc::u32_at(psv, 4 + 20).unwrap();
+        assert_eq!((min_wave, max_wave), (32, 32));
+    }
 }
+

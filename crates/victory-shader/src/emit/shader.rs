@@ -98,6 +98,8 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Maximum view descriptor heap slot index before memory-by-address slots.
+    pub own_slots: u32,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -157,6 +159,7 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            own_slots: super::OWN_SLOTS,
             lds_dwords: 0,
             lds: None,
             main,
@@ -405,7 +408,7 @@ impl Shader {
     ) -> V {
         // An index past the heap is a fault that stops the host GPU.
         let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::OWN_SLOTS - 1);
+            let last = self.m.i32(self.own_slots - 1);
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {

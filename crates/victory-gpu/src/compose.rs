@@ -128,6 +128,12 @@ pub(crate) fn record(
     back: &ID3D12Resource,
     (width, height, format): (u32, u32, DXGI_FORMAT),
 ) -> bool {
+    if crate::fsr::enabled()
+        && let Some(scene) = planes[0]
+        && crate::fsr::record(host, list, scene, planes[1], back, (width, height, format))
+    {
+        return true;
+    }
     static COMPOSER: std::sync::Mutex<Option<(DXGI_FORMAT, Option<Composer>)>> =
         std::sync::Mutex::new(None);
     let mut composer = COMPOSER.lock().unwrap_or_else(|e| e.into_inner());

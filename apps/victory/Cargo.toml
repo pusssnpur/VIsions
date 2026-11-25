@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 victory-core.workspace = true
+victory-gpu.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
@@ -20,11 +21,24 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [
     "victory-core/diagnostics",
+    "victory-gpu/diagnostics",
     "victory-hle/diagnostics",
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
@@ -32,3 +46,4 @@ diagnostics = [
 
 [lints]
 workspace = true
+

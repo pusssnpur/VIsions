@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod gui;
 mod inspect;
 mod run;
 mod shader;
@@ -22,11 +23,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the standalone native Win32/D3D12 launcher & settings window
+    /// (also the default when `victory` is launched with no arguments).
+    Gui,
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -115,14 +119,14 @@ enum Command {
     Config,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Unimplemented {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Unimplemented {
     Trap,
     Zero,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Console {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Console {
     SeriesX,
     SeriesS,
 }
@@ -135,7 +139,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    match cli.command.unwrap_or(Command::Gui) {
+        Command::Gui => gui::run(),
         Command::Inspect {
             file,
             imports,
@@ -208,6 +213,19 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    println!(
+        "fsr         : {} (sharpness {:?}, resolution {:?})",
+        cfg.gpu.fsr.as_deref().unwrap_or("off"),
+        cfg.gpu.fsr_sharpness.unwrap_or(0.2),
+        cfg.gpu.fsr_resolution.as_deref().unwrap_or("auto")
+    );
+    println!(
+        "vram_budget : {} MiB (texture_max {}, card_buffers {} MiB, staging {} MiB)",
+        cfg.gpu.vram_budget_mb.unwrap_or(0),
+        cfg.gpu.texture_max.unwrap_or(0),
+        cfg.gpu.card_buffers_mb.unwrap_or(512),
+        cfg.gpu.staging_budget_mb.unwrap_or(192)
+    );
     for p in cfg
         .game_dir
         .iter()

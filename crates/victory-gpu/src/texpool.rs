@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 
-/// Textures larger than this have memory of their own.
-const LARGEST: u64 = 8 << 20;
+/// Textures larger than this have memory of their own so releasing one
+/// returns its VRAM immediately instead of pinning a multi-megabyte slab.
+const LARGEST: u64 = 2 << 20;
 
 struct Slab {
     /// `None` once no slot was used.
@@ -74,7 +75,8 @@ fn class(bytes: u64) -> u64 {
 fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(Slot, Memory)> {
     let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
     let of = slabs.entry(size).or_default();
-    let bytes = (size.0 * 8).clamp(1 << 20, 16 << 20).next_multiple_of(64 << 10);
+    let max_slab = if crate::host::is_4gb_card() { 2 << 20 } else { 4 << 20 };
+    let bytes = (size.0 * 4).clamp(512 << 10, max_slab).next_multiple_of(64 << 10);
     let used = of.iter().position(|s| s.memory.is_some() && !s.free.is_empty());
     let at = match used.or_else(|| of.iter().position(|s| s.memory.is_none())) {
         Some(at) => at,
@@ -129,11 +131,27 @@ pub(crate) fn place(
         return None;
     }
     let mut desc = *desc;
-    // Small textures may lie on multiples of 4 KiB.
-    desc.Alignment = 4 << 10;
-    // SAFETY: a whole description.
-    let mut info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
-    if info.Alignment != 4 << 10 || info.SizeInBytes == u64::MAX {
+    // Small textures may lie on multiples of 4 KiB; only probe 4 KiB alignment
+    // when dimensions can fit a 64 KiB tile so NVIDIA drivers do not log
+    // rejected small-resource alignment queries on large textures.
+    let try_small = desc.Width <= 256 && desc.Height <= 256 && desc.DepthOrArraySize <= 4;
+    let mut info = if try_small {
+        desc.Alignment = 4 << 10;
+        // SAFETY: a whole description.
+        let info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
+        if info.Alignment != 4 << 10 || info.SizeInBytes == u64::MAX {
+            desc.Alignment = 0;
+            // SAFETY: as above.
+            unsafe { device.GetResourceAllocationInfo(0, &[desc]) }
+        } else {
+            info
+        }
+    } else {
+        desc.Alignment = 0;
+        // SAFETY: a whole description.
+        unsafe { device.GetResourceAllocationInfo(0, &[desc]) }
+    };
+    if info.SizeInBytes == u64::MAX {
         desc.Alignment = 0;
         // SAFETY: as above.
         info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };

@@ -109,14 +109,15 @@ static USES: AtomicU64 = AtomicU64::new(0);
 
 /// The staging bytes kept before the least recently used buffers no list
 /// holds are released (made again, and detiled whole, on their next use):
-/// `VICTORY_STAGING_BUDGET_MB`, 384 MiB by default.
+/// `VICTORY_STAGING_BUDGET_MB`, 192 MiB by default.
 fn budget() -> u64 {
     static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
+        let default_mb = if crate::host::is_4gb_card() { 96 } else { 192 };
         std::env::var("VICTORY_STAGING_BUDGET_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(384)
+            .unwrap_or(default_mb)
             << 20
     })
 }
@@ -747,6 +748,7 @@ mod tests {
             slot: None,
             skip: 0,
             written: Default::default(),
+            used: Default::default(),
             twin: Default::default(),
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),

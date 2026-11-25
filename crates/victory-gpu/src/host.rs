@@ -93,13 +93,65 @@ static RETIRED: Mutex<std::collections::VecDeque<Retired>> =
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Dedicated VRAM of the active adapter in MiB (0 until queried).
+static DEDICATED_VRAM_MIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dedicated video memory of the host adapter in MiB, or 0 if not yet known.
+pub(crate) fn dedicated_vram_mib() -> u64 {
+    let cached = DEDICATED_VRAM_MIB.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    if let Some([(_, budget), _]) = video_memory()
+        && budget > 0
+    {
+        return budget >> 20;
+    }
+    0
+}
+
+/// Whether the host GPU is a 4 GB class card (<= 4.5 GiB dedicated VRAM or
+/// `VICTORY_VRAM_BUDGET_MB <= 2560`).
+pub(crate) fn is_4gb_card() -> bool {
+    static EXPLICIT_4GB: OnceLock<bool> = OnceLock::new();
+    if *EXPLICIT_4GB.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .is_some_and(|mb| (1..=2560).contains(&mb))
+    }) {
+        return true;
+    }
+    let mib = dedicated_vram_mib();
+    (1..=4608).contains(&mib)
+}
+
 /// Presented host frames a retired object is also kept for. Worker threads
 /// record lists ahead of submission and a title frame spans many
 /// submissions, so finishing the submissions running when it was retired
 /// is not enough on its own. Ages are in frames presented to the host, not
 /// the title's 60 Hz clock (which ticks many times per host frame while
 /// the host runs at 1-2 fps).
-const KEEP_FRAMES: u64 = 32;
+const KEEP_FRAMES: u64 = 8;
+
+fn keep_frames() -> u64 {
+    static KEEP: OnceLock<Option<u64>> = OnceLock::new();
+    let explicit = *KEEP.get_or_init(|| {
+        std::env::var("VICTORY_KEEP_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    let low_vram = is_4gb_card();
+    let base = explicit.unwrap_or(if low_vram { 2 } else { KEEP_FRAMES });
+    let pct = crate::resource::video_memory_percent();
+    if low_vram && pct >= 60 {
+        base.min(1)
+    } else if pct >= 75 {
+        base.min(2)
+    } else {
+        base
+    }
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
@@ -126,6 +178,15 @@ pub(crate) fn retire<T: 'static>(object: T) {
     });
 }
 
+/// Reaps any completed GPU submissions and immediately buries retired objects
+/// whose submission fence has finished.
+pub(crate) fn flush_retired() {
+    if let Some(Some(h)) = HOST.get() {
+        h.reap_completed();
+    }
+    bury(FINISHED.load(Ordering::Acquire));
+}
+
 /// Drops what waited for submissions up to `finished` and is old enough
 /// in presented frames.
 fn bury(finished: u64) {
@@ -135,13 +196,14 @@ fn bury(finished: u64) {
         return;
     }
     let now = crate::queue::presented();
+    let keep = keep_frames();
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
         let n = retired
             .iter()
             .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                r.submission <= finished && now.saturating_sub(r.frame) >= keep
             })
             .count();
         retired.drain(..n).collect()
@@ -467,9 +529,12 @@ fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
             factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
         let desc = adapter.GetDesc1()?;
         let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let vram_mb = (desc.DedicatedVideoMemory >> 20) as u64;
+        DEDICATED_VRAM_MIB.store(vram_mb, Ordering::Relaxed);
         tracing::info!(
             name = String::from_utf16_lossy(&desc.Description[..end]),
-            vram_mb = desc.DedicatedVideoMemory >> 20,
+            vram_mb,
+            low_vram_4gb = (1..=4608).contains(&vram_mb),
             "host adapter"
         );
         Ok(adapter)
@@ -844,8 +909,8 @@ const SCRATCH_CHUNK: u64 = 512 << 10;
 /// keeping the chunks of its largest use added up to gigabytes, as the title
 /// has hundreds of lists.
 static SCRATCH_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
-/// Free chunks kept; more are released.
-const SCRATCH_KEPT: usize = 256;
+/// Free chunks kept (32 MiB); more are released.
+const SCRATCH_KEPT: usize = 64;
 
 impl Scratch {
     fn give_back(&mut self) {
@@ -986,6 +1051,24 @@ impl Host {
     pub(crate) fn target(&self) -> victory_shader::emit::Target {
         static TARGET: OnceLock<victory_shader::emit::Target> = OnceLock::new();
         *TARGET.get_or_init(|| {
+            if let Some(override_lanes) = std::env::var("VICTORY_HOST_LANES").ok().and_then(|s| {
+                let (a, b) = s.trim().split_once('-').unwrap_or((s.trim(), s.trim()));
+                let min = a.trim().parse::<u32>().ok()?;
+                let max = b.trim().parse::<u32>().ok()?;
+                (min.is_power_of_two() && max.is_power_of_two() && min <= max).then_some(
+                    victory_shader::emit::Target {
+                        lanes_min: min,
+                        lanes_max: max,
+                    },
+                )
+            }) {
+                tracing::info!(
+                    lanes_min = override_lanes.lanes_min,
+                    lanes_max = override_lanes.lanes_max,
+                    "host wave sizes (from VICTORY_HOST_LANES)"
+                );
+                return override_lanes;
+            }
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
             // SAFETY: the query writes the structure of the given size.
             let ok = unsafe {
@@ -1011,8 +1094,8 @@ impl Host {
                 "host wave sizes"
             );
             if !target.runs(64) {
-                tracing::warn!(
-                    "the host has no 64-lane waves: console wave64 compute programs that read                      other lanes do not translate, and their dispatches are dropped"
+                tracing::info!(
+                    "32-lane wave host (NVIDIA): console wave64 compute shaders use Wave64-on-Wave32 split/exchange emulation"
                 );
             }
             target
@@ -3229,8 +3312,9 @@ impl Host {
             ..Default::default()
         };
         let use_gpu_upload = self.gpu_upload
+            && !is_4gb_card()
             && video_memory().is_none_or(|[(used, budget), _]| {
-                budget == 0 || used.saturating_add(size) < budget * 85 / 100
+                budget == 0 || used.saturating_add(size) < budget * 65 / 100
             });
         let try_make = |heap_type: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
             let heap = D3D12_HEAP_PROPERTIES {
@@ -3456,8 +3540,14 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
+        crate::resource::trim_vram();
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let fsr_tag = if crate::fsr::enabled() {
+            format!(" [FSR {}]", crate::fsr::config().mode.label())
+        } else {
+            String::new()
+        };
+        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame{fsr_tag}");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -3497,7 +3587,8 @@ impl Host {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (in_width, in_height) = (desc.Width as u32, desc.Height);
+        let (width, height) = crate::fsr::config().output_dimensions(in_width, in_height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -3532,31 +3623,70 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            let used_fsr = if crate::fsr::enabled() {
+                let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                let mut into = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, target)];
+                if state != read {
+                    into.push(transition(texture, state, read));
+                }
+                list.ResourceBarrier(&into);
+                let ok = crate::fsr::record(
+                    self,
+                    list,
+                    (texture, format),
+                    None,
                     &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+                    (width, height, format),
+                );
+                let mut out = vec![transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)];
+                if state != read {
+                    out.push(transition(texture, read, state));
+                }
+                list.ResourceBarrier(&out);
+                ok
+            } else {
+                false
+            };
+            if !used_fsr {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let (capture, probe) = {
+                list.ResourceBarrier(&[transition(
+                    texture,
+                    state,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, texture))
+                    .flatten();
+                let probe = crate::capture::probe(&self.device, list, texture);
+                list.ResourceBarrier(&[transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    state,
+                )]);
+                (capture, probe)
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -3583,11 +3713,12 @@ impl Host {
         self.wait_in_flight();
         // SAFETY: live resources.
         let (a, b) = unsafe { (scene.map(|s| s.0.GetDesc()), over.0.GetDesc()) };
-        // The scene's size; with a smaller one (or none) the screen's.
-        let (width, height) = match a {
-            Some(a) if a.Height >= 1080 => (a.Width as u32, a.Height),
+        // The scene's size (upscaled when FSR is active); with a smaller one (or none) the screen's.
+        let (in_width, in_height) = match a {
+            Some(a) if a.Height >= 720 => (a.Width as u32, a.Height),
             _ => (1920, 1080),
         };
+        let (width, height) = crate::fsr::config().output_dimensions(in_width, in_height);
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {

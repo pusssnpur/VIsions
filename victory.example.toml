@@ -17,3 +17,35 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[gpu]
+# Console profile: "series-x" or "series-s" (Series S uses significantly less VRAM).
+# console = "series-x"
+
+# AMD FSR 1.0 upscaling preset: "off", "ultra-quality", "quality", "balanced", "performance"
+# env: VICTORY_FSR
+# fsr = "quality"
+
+# FSR RCAS sharpening attenuation in stops (0.0 = sharpest, 2.0 = softest; default 0.2).
+# env: VICTORY_FSR_SHARPNESS
+# fsr_sharpness = 0.2
+
+# Explicit output resolution for FSR upscaling (e.g. "1920x1080", "2560x1440", "3840x2160").
+# env: VICTORY_FSR_RESOLUTION
+# fsr_resolution = "2560x1440"
+
+# Host VRAM budget cap for placed/streamed textures in MiB (0 = auto: 45% / 1536 MiB on 4 GB cards, 65% on 8 GB+ cards).
+# env: VICTORY_VRAM_BUDGET_MB
+# vram_budget_mb = 0
+
+# Max streamed BC texture side length (0 = auto by VRAM usage; 256/128/64 on 4 GB cards, 1024/512/256 on 8 GB+ cards).
+# env: VICTORY_TEXTURE_MAX
+# texture_max = 0
+
+# Device-local VRAM card buffer pool cap in MiB (0 = disable VRAM card buffers, auto-disabled on 4 GB cards; default 512).
+# env: VICTORY_CARD_BUFFERS_MB
+# card_buffers_mb = 512
+
+# Texture upload staging buffer budget in MiB (default 96 on 4 GB cards, 192 on 8 GB+ cards).
+# env: VICTORY_STAGING_BUDGET_MB
+# staging_budget_mb = 192

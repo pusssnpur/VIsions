@@ -135,8 +135,8 @@ fn pooled(n: usize) -> Vec<u8> {
 /// each time, a tenth of the submitting thread's time).
 static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// Tile snapshots kept at most (512 MiB).
-const TILE_POOL_MOST: usize = 8192;
+/// Tile snapshots kept at most (128 MiB).
+const TILE_POOL_MOST: usize = 2048;
 
 /// An empty buffer with room for a tile.
 fn pooled_tile() -> Vec<u8> {
@@ -178,7 +178,7 @@ pub(crate) fn pool_bytes() -> u64 {
 
 /// Bytes the pool keeps at most: snapshots of the world's 174 MB heap
 /// would otherwise keep 8 of that size (1.4 GB of host memory) for good.
-const POOL_BYTES: usize = 512 << 20;
+const POOL_BYTES: usize = 256 << 20;
 
 /// Returns a snapshot buffer to the pool (at most 8 kept, the largest,
 /// and no more than [`POOL_BYTES`] in all).
