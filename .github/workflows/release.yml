@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload binaries to (e.g. v0.2.0)"
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Release Binary (victory.exe)
+        run: cargo build --release -p victory --locked
+      - name: Build Diagnostics Binary (victory-diag.exe)
+        run: cargo build --profile diag -p victory --features diagnostics --locked
+      - name: Stage Release Binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/victory.exe dist/victory.exe
+          Copy-Item target/diag/victory.exe dist/victory-diag.exe
+          Get-FileHash dist/victory.exe, dist/victory-diag.exe -Algorithm SHA256 | Format-Table -AutoSize
+      - name: Upload Binaries to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          Write-Host "Publishing release assets for tag: $tag"
+          gh release view $tag --repo ${{ github.repository }} 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag dist/victory.exe dist/victory-diag.exe --repo ${{ github.repository }} --title "$tag — VIctory Windows x64 Release" --generate-notes
+          } else {
+            gh release upload $tag dist/victory.exe dist/victory-diag.exe --clobber --repo ${{ github.repository }}
+          }
