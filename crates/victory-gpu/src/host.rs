@@ -1343,9 +1343,13 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
+        static ASYNC_SUBMIT: OnceLock<bool> = OnceLock::new();
+        let async_enabled = *ASYNC_SUBMIT.get_or_init(|| {
+            std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0")
+        });
         let can_async = !cfg!(test)
             && !each
-            && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+            && async_enabled
             && card_writes.is_empty()
             && cpu_back.is_empty()
             && runs.iter().all(|list| {
@@ -1528,7 +1532,7 @@ impl Host {
                     COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 }
             } else {
-                in_parallel(&groups, 8, |chunk| {
+                in_parallel(&groups, 1, |chunk| {
                     for g in chunk {
                         for (shadow, address, len) in g {
                             let written = shadow.copy_back(*address, *len);
@@ -2627,6 +2631,45 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut uploads = Vec::new();
+        let mut pending_textures: Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )> = Vec::new();
+        let flush_textures = |pending: &mut Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )>,
+                              uploads: &mut Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )>| {
+            if pending.is_empty() {
+                return;
+            }
+            if pending.len() == 1 {
+                let (staging, copy) = pending.pop().unwrap();
+                if staging.refresh() {
+                    uploads.push((staging, copy));
+                }
+                return;
+            }
+            let dirty: Vec<std::sync::atomic::AtomicBool> = (0..pending.len())
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect();
+            let indexed: Vec<usize> = (0..pending.len()).collect();
+            in_parallel(&indexed, 1, |chunk| {
+                for &idx in chunk {
+                    if pending[idx].0.refresh() {
+                        dirty[idx].store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            for (idx, item) in pending.drain(..).enumerate() {
+                if dirty[idx].load(Ordering::Relaxed) {
+                    uploads.push(item);
+                }
+            }
+        };
         let deferred = self.deferred();
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
@@ -2642,6 +2685,7 @@ impl HostList {
         for step in &deferred.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
+                    flush_textures(&mut pending_textures, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -2671,6 +2715,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    flush_textures(&mut pending_textures, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
@@ -2684,17 +2729,19 @@ impl HostList {
                     }
                 }
                 Step::GpuWrite(shadow, address, len) => {
+                    flush_textures(&mut pending_textures, &mut uploads);
                     // The shaders start from the title's data.
                     batch.flush();
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
-                        uploads.push((staging.clone(), copy.clone()));
+                    if batch.texture_due(staging) {
+                        pending_textures.push((staging.clone(), copy.clone()));
                     }
                 }
             }
         }
+        flush_textures(&mut pending_textures, &mut uploads);
         if copy_bytes > 0 || copy_us > 0 {
             PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copy_bytes, Ordering::Relaxed);
@@ -2782,11 +2829,22 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
-            update(&shadow, from, to - from);
+        let refreshes = std::mem::take(&mut self.refreshes);
+        if refreshes.len() <= 1 {
+            for (shadow, from, to) in refreshes {
+                update(&shadow, from, to - from);
+            }
+        } else {
+            in_parallel(&refreshes, 1, |chunk| {
+                for (shadow, from, to) in chunk {
+                    update(shadow, *from, *to - *from);
+                }
+            });
         }
         let mut pieces = std::mem::take(&mut self.pieces);
         pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
+        let mut merged: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::with_capacity(pieces.len());
         let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
         for (shadow, from, to) in pieces {
             if let Some((s, _, end)) = &mut run
@@ -2796,12 +2854,23 @@ impl Batch {
                 *end = (*end).max(to);
                 continue;
             }
-            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
-                update(&s, a, b - a);
+            if let Some(prev) = run.replace((shadow, from, to)) {
+                merged.push(prev);
             }
         }
-        if let Some((s, a, b)) = run {
-            update(&s, a, b - a);
+        if let Some(prev) = run {
+            merged.push(prev);
+        }
+        if merged.len() <= 1 {
+            for (s, a, b) in merged {
+                update(&s, a, b - a);
+            }
+        } else {
+            in_parallel(&merged, 2, |chunk| {
+                for (s, a, b) in chunk {
+                    update(s, *a, *b - *a);
+                }
+            });
         }
     }
 
@@ -2823,7 +2892,7 @@ impl Batch {
             if !reads.is_empty() {
                 let started = std::time::Instant::now();
                 let copied = std::sync::atomic::AtomicU64::new(0);
-                in_parallel(reads, 8, |reads| {
+                in_parallel(reads, 2, |reads| {
                     for (shadow, address, len) in reads {
                         #[cfg(feature = "diagnostics")]
                         {
@@ -2882,13 +2951,37 @@ impl Early {
                 used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
             }
         }
+        let candidates: Vec<_> = first
+            .into_iter()
+            .filter(|(staging, copy)| {
+                !used.contains(&(std::sync::Arc::as_ptr(copy) as usize))
+                    && batch.texture_due(staging)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let dirty: Vec<std::sync::atomic::AtomicBool> = (0..candidates.len())
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
+        if candidates.len() == 1 {
+            if candidates[0].0.refresh() {
+                dirty[0].store(true, Ordering::Relaxed);
+            }
+        } else {
+            let indexed: Vec<usize> = (0..candidates.len()).collect();
+            in_parallel(&indexed, 1, |chunk| {
+                for &idx in chunk {
+                    if candidates[idx].0.refresh() {
+                        dirty[idx].store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
         const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        for (staging, copy) in first {
-            if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
-                || !batch.texture_due(&staging)
-                || !staging.refresh()
-            {
+        for (idx, (staging, copy)) in candidates.into_iter().enumerate() {
+            if !dirty[idx].load(Ordering::Relaxed) {
                 continue;
             }
             let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
@@ -2952,12 +3045,15 @@ impl Early {
 
 /// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
-    const THREADS: usize = 6;
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    let max_threads = *THREADS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(6, |n| n.get().clamp(4, 12))
+    });
     if list.len() <= least {
         return f(list);
     }
     // Small pieces, taken in turn: they are not equally long to do.
-    let piece = (list.len() / (THREADS * 8)).max(least);
+    let piece = (list.len() / (max_threads * 8)).max(least);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
         loop {
@@ -2968,7 +3064,7 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
             f(&list[from..(from + piece).min(list.len())]);
         }
     };
-    let threads = THREADS.min(list.len().div_ceil(piece));
+    let threads = max_threads.min(list.len().div_ceil(piece));
     std::thread::scope(|s| {
         for _ in 1..threads {
             s.spawn(work);
