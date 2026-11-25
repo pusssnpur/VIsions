@@ -47,7 +47,20 @@ jobs:
           Write-Host "Publishing release assets for tag: $tag"
           gh release view $tag --repo ${{ github.repository }} 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag dist/victory.exe dist/victory-diag.exe --repo ${{ github.repository }} --title "$tag — VIctory Windows x64 Release" --generate-notes
-          } else {
-            gh release upload $tag dist/victory.exe dist/victory-diag.exe --clobber --repo ${{ github.repository }}
+            gh release create $tag --repo ${{ github.repository }} --title "$tag — VIctory Windows x64 Release" --generate-notes
+          }
+          foreach ($file in @("dist/victory.exe", "dist/victory-diag.exe")) {
+            $name = Split-Path $file -Leaf
+            $existing = gh release view $tag --repo ${{ github.repository }} --json assets --jq ".assets[].name"
+            if ($existing -contains $name) {
+              Write-Host "Asset $name is already attached to $tag"
+              continue
+            }
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+              Write-Host "Uploading $file (attempt $attempt)..."
+              gh release upload $tag $file --clobber --repo ${{ github.repository }}
+              if ($LASTEXITCODE -eq 0) { break }
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+            if ($LASTEXITCODE -ne 0) { exit 1 }
           }
